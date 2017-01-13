@@ -2,8 +2,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <omp.h>
 
 #include "types.h"
+
+#define min(a, b) (((a) < (b)) ? (a) : (b))
 
 // сила, действующая на частицу p1 со стороны частицы p2
 Vector force(Vector *r1, Vector *r2) {
@@ -25,16 +28,20 @@ Vector force(Vector *r1, Vector *r2) {
 }
 
 int main(int argc, char *argv[]) {
+    float start, end, total;
     int n = 1000;
     float all_time = 1;
     float dt = 1e-3;
     int rank, size;
     FILE *fd;
+    MPI_Status status;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    /* create a type for type Vector */
+    
+    // MPI_VECTOR - обёртка для Vector 
+    // для использования в MPI
     const int    nitems=3;
     int          blocklengths[3] = {1,1,1};
     MPI_Datatype types[3] = {MPI_FLOAT, MPI_FLOAT, MPI_FLOAT};
@@ -51,7 +58,7 @@ int main(int argc, char *argv[]) {
 
     Vector *rs = (Vector *)malloc(n * sizeof(Vector));
     
-    int n1 = n / size;
+    int n1 = n / size + 1;
     Vector *vs1 = malloc(n1 * sizeof(Vector));
     Vector *forces1 = malloc(n1 * sizeof(Vector));
 
@@ -113,35 +120,35 @@ int main(int argc, char *argv[]) {
         free(vs);
         free(forces);
     } else {
-        MPI_Status status;
         MPI_Recv(vs1, n1, MPI_VECTOR, 0, 2, MPI_COMM_WORLD, &status);
     }
 
     // симуляция
     if (rank == 0) {
+        
+        start = omp_get_wtime();
         puts("simulation");
     }
     for (float t = 0; t < all_time; t += dt) {
         // отправляем положения частиц всем процессам
         if (rank == 0) {
-            printf("%f of %f\n", t, all_time);
+            //printf("%f of %f\n", t, all_time);
             for (int i = 1; i < size; ++i) {
                 MPI_Send(rs, n, MPI_VECTOR, i, 1, MPI_COMM_WORLD);
             }    
         } else {
-            // получаем из главного процесса положения атомов
-            MPI_Status status;
+            // получаем из главного процесса положения частиц
             MPI_Recv(rs, n, MPI_VECTOR, 0, 1, MPI_COMM_WORLD, &status);
         }
         
         // перерасчёт положений
-        for (int i = 0; i < n1; ++i) {
+        for (int i = 0; i < n1 && rank * n1 + i < n; ++i) {
             rs[rank * n1 + i].x += vs1[i].x * dt;
             rs[rank * n1 + i].y += vs1[i].y * dt;
             rs[rank * n1 + i].z += vs1[i].z * dt;
         }
         // перерасчёт сил для частиц, за которые отвечает этот процесс
-        for (int i = 0; i < n1; ++i) {
+        for (int i = 0; i < n1 && rank * n1 + i < n; ++i) {
             for (int j = 0; j < n; ++j) {
                 if (j != rank * n1 + i) {
                     Vector f = force(rs + rank * n1 + i, rs + j);
@@ -152,20 +159,19 @@ int main(int argc, char *argv[]) {
             }
         }
         // перерасчёт скоростей
-        for (int i = 0; i < n1; ++i) {
+        for (int i = 0; i < n1 && rank * n1 + i < n; ++i) {
             vs1[i].x += forces1[i].x * dt;
             vs1[i].y += forces1[i].y * dt;
             vs1[i].z += forces1[i].z * dt;
         }
         if (rank != 0) {
-            MPI_Send(rs + rank * n1, n1, MPI_VECTOR, 0, 1, MPI_COMM_WORLD);
+            MPI_Send(rs + rank * n1, min(n1, n - rank * n1), MPI_VECTOR, 0, 1, MPI_COMM_WORLD);
         }
         if (rank == 0) {
             // получаем данные от процессов
             for (int i = 1; i < size; ++i)
             {
-                MPI_Status status;
-                MPI_Recv(rs + i * n1, n1, MPI_VECTOR, i, 1, MPI_COMM_WORLD, &status);
+                MPI_Recv(rs + i * n1, min(n1, n - i * n1), MPI_VECTOR, i, 1, MPI_COMM_WORLD, &status);
             }
             
             // дампим в файл
@@ -176,9 +182,20 @@ int main(int argc, char *argv[]) {
     if (rank == 0) {
         fclose(fd);
     }
+    if(rank == 0) {
+    puts("end simulation");
+    end = omp_get_wtime();
+    total = end - start;
+    printf("Elapsed Time: %f seconds\n", total);
+    }
+
+
     free(forces1);
     free(rs);
     free(vs1);
+
     MPI_Finalize();
+
+    
     return 0;
 }
